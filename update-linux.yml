@@ -1,0 +1,136 @@
+---
+- name: Update Debian and Ubuntu homelab systems
+  hosts: all
+  become: true
+  gather_facts: true
+
+  # Werk één host tegelijk bij.
+  # Handig voor bijvoorbeeld twee Pi-hole-servers.
+  serial: 1
+
+  vars:
+    apt_cache_valid_time: 3600
+    apt_lock_timeout: 300
+    minimum_free_space_bytes: 1073741824  # 1 GiB
+
+  pre_tasks:
+    - name: Verify that this is a supported Debian-family system
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family == "Debian"
+          - ansible_facts.pkg_mgr == "apt"
+        fail_msg: >-
+          {{ inventory_hostname }} is geen ondersteund Debian/Ubuntu-systeem.
+          Deze host wordt niet bijgewerkt.
+        success_msg: >-
+          {{ inventory_hostname }} gebruikt APT en kan worden bijgewerkt.
+
+    - name: Find root filesystem information
+      ansible.builtin.set_fact:
+        root_filesystem: >-
+          {{
+            ansible_facts.mounts
+            | selectattr('mount', 'equalto', '/')
+            | list
+            | first
+            | default({})
+          }}
+
+    - name: Verify available disk space
+      ansible.builtin.assert:
+        that:
+          - root_filesystem.size_available is defined
+          - root_filesystem.size_available | int >= minimum_free_space_bytes
+        fail_msg: >-
+          {{ inventory_hostname }} heeft minder dan 1 GiB vrije ruimte op /,
+          of de beschikbare ruimte kon niet worden vastgesteld.
+          De upgrade wordt voor deze host afgebroken.
+        success_msg: >-
+          {{ inventory_hostname }} heeft voldoende vrije schijfruimte.
+
+    - name: Show system information before updating
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "OS: {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}"
+          - "Kernel: {{ ansible_facts.kernel }}"
+          - "Vrij op /: {{ (root_filesystem.size_available | int / 1024 / 1024 / 1024) | round(2) }} GiB"
+
+  tasks:
+    - name: Update APT package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: "{{ apt_cache_valid_time }}"
+        lock_timeout: "{{ apt_lock_timeout }}"
+        force_apt_get: true
+      register: apt_cache_result
+
+    - name: Perform full system upgrade
+      ansible.builtin.apt:
+        upgrade: full
+        lock_timeout: "{{ apt_lock_timeout }}"
+        force_apt_get: true
+      register: apt_upgrade_result
+
+    - name: Remove unused packages and dependencies
+      ansible.builtin.apt:
+        autoremove: true
+        purge: true
+        lock_timeout: "{{ apt_lock_timeout }}"
+        force_apt_get: true
+      register: apt_autoremove_result
+
+    - name: Remove obsolete package files
+      ansible.builtin.apt:
+        autoclean: true
+        lock_timeout: "{{ apt_lock_timeout }}"
+        force_apt_get: true
+
+    - name: Clear downloaded APT package cache
+      ansible.builtin.apt:
+        clean: true
+        lock_timeout: "{{ apt_lock_timeout }}"
+        force_apt_get: true
+
+    - name: Check whether a reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Check which packages require a reboot
+      ansible.builtin.slurp:
+        src: /var/run/reboot-required.pkgs
+      register: reboot_required_packages
+      when: reboot_required.stat.exists
+      failed_when: false
+      changed_when: false
+
+  post_tasks:
+    - name: Display update result
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "APT-cache bijgewerkt: {{ apt_cache_result.changed }}"
+          - "Systeem bijgewerkt: {{ apt_upgrade_result.changed }}"
+          - "Ongebruikte pakketten verwijderd: {{ apt_autoremove_result.changed }}"
+          - "Herstart vereist: {{ reboot_required.stat.exists }}"
+
+    - name: Display packages associated with required reboot
+      ansible.builtin.debug:
+        msg: >-
+          Herstart vereist vanwege:
+          {{
+            reboot_required_packages.content
+            | b64decode
+            | trim
+          }}
+      when:
+        - reboot_required.stat.exists
+        - reboot_required_packages.content is defined
+
+    - name: Warn that the host must be rebooted manually
+      ansible.builtin.debug:
+        msg: >-
+          LET OP: {{ inventory_hostname }} moet opnieuw worden opgestart.
+          Dit playbook voert bewust geen automatische reboot uit.
+      when: reboot_required.stat.exists
